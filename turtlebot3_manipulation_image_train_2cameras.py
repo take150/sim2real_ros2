@@ -34,17 +34,59 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
         )
         DeterministicMixin.__init__(self, clip_actions=False, role="value")
 
+        # mean = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
+        # std  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
+        # self.register_buffer("rgb_mean", mean)
+        # self.register_buffer("rgb_std",  std)
+
+        # self.preprocess = tv_models.ResNet34_Weights.DEFAULT.transforms()
+
+        # self.features_extractor_resnet = nn.Sequential(
+        #     *list(tv_models.resnet34(
+        #         weights=tv_models.ResNet34_Weights.DEFAULT
+        #     ).children())[:-2]
+        # ).to(device)
+
+        # for param in self.features_extractor_resnet.parameters():
+        #     param.requires_grad_(False)
+
+        # for m in self.features_extractor_resnet.modules():
+        #     if isinstance(m, nn.BatchNorm2d):
+        #         m.eval()
+        #         # BN の weight/bias も更新不要に
+        #         m.weight.requires_grad_(False)
+        #         m.bias.requires_grad_(False)
+
         self.features_extractor_rgb_container = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=7, stride=2, padding=3),
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=7, stride=3, padding=2),
             nn.PReLU(),
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
             nn.PReLU(),
             nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
             nn.PReLU(),
+        )
+
+        # self.features_extractor_rgb_container_2 = nn.Sequential(
+        #     nn.Conv2d(in_channels=3, out_channels=32, kernel_size=7, stride=3, padding=2),
+        #     nn.PReLU(),
+        #     nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
+        #     nn.PReLU(),
+        #     nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
+        #     nn.PReLU(),
+        # )
+
+        self.features_cross_attention_container = nn.MultiheadAttention(
+            embed_dim=128,
+            num_heads=8,
+            batch_first=True,
+        )
+
+        self.features_concat_rgb_container = nn.Sequential(
             nn.Flatten(),
-            nn.LazyLinear(out_features=512),
+            nn.LazyLinear(out_features=1024),
             nn.PReLU(),
         )
+
         self.features_extractor_joints_container = nn.Sequential(
             nn.LazyLinear(out_features=64),
             nn.PReLU(),
@@ -69,9 +111,25 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
         if role == "policy":
             states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
             taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-            features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
+            # with torch.no_grad():
+            #     rgb = states["rgb"].permute(0,3,1,2).to(self.device)
+            #     rgb = self.preprocess(rgb)
+            #     rgb = self.features_extractor_resnet(rgb)
+            # rgb = states["rgb"].permute(0,3,1,2).float().to(self.device) / 255.0
+            # rgb = (rgb - self.rgb_mean) / self.rgb_std
+            features_extractor_rgb_1 = self.features_extractor_rgb_container(torch.permute(states['rgb_1'], (0, 3, 1, 2)))
+            features_extractor_rgb_2 = self.features_extractor_rgb_container(torch.permute(states['rgb_2'], (0, 3, 1, 2)))
+            # features_extractor_rgb = self.features_extractor_rgb_container(states["rgb"])
+            tokens_1 = features_extractor_rgb_1.flatten(2).transpose(1, 2)
+            tokens_2 = features_extractor_rgb_2.flatten(2).transpose(1, 2)
+            features_cross_attention_1, _ = self.features_cross_attention_container(tokens_1, tokens_2, tokens_2)
+            features_cross_attention_2, _ = self.features_cross_attention_container(tokens_2, tokens_1, tokens_1)
+            
+            features_concat_rgb = self.features_concat_rgb_container(torch.cat([features_cross_attention_1, features_cross_attention_2], dim=-1))
             features_extractor_joints = self.features_extractor_joints_container(states['joint'])
-            net = self.net_container(torch.cat([features_extractor_joints, features_extractor_rgb], dim=1))
+            net = self.net_container(torch.cat([features_extractor_joints, features_concat_rgb], dim=1))
+            # features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
+            # net = self.net_container(torch.cat([states['joint'], features_extractor_rgb], dim=1))
             self._shared_output = net
             output = self.policy_layer(net)
             output = nn.functional.tanh(output)
@@ -80,9 +138,25 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
             if self._shared_output is None:
                 states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
                 taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-                features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
+                # with torch.no_grad():
+                #     rgb = states["rgb"].permute(0,3,1,2).to(self.device)
+                #     rgb = self.preprocess(rgb)
+                #     rgb = self.features_extractor_resnet(rgb)
+                # rgb = states["rgb"].permute(0,3,1,2).float().to(self.device) / 255.0
+                # rgb = (rgb - self.rgb_mean) / self.rgb_std
+                features_extractor_rgb_1 = self.features_extractor_rgb_container(torch.permute(states['rgb_1'], (0, 3, 1, 2)))
+                features_extractor_rgb_2 = self.features_extractor_rgb_container(torch.permute(states['rgb_2'], (0, 3, 1, 2)))
+                # features_extractor_rgb = self.features_extractor_rgb_container(states["rgb"])
+                tokens_1 = features_extractor_rgb_1.flatten(2).transpose(1, 2)
+                tokens_2 = features_extractor_rgb_2.flatten(2).transpose(1, 2)
+                features_cross_attention_1, _ = self.features_cross_attention_container(tokens_1, tokens_2, tokens_2)
+                features_cross_attention_2, _ = self.features_cross_attention_container(tokens_2, tokens_1, tokens_1)
+                
+                features_concat_rgb = self.features_concat_rgb_container(torch.cat([features_cross_attention_1, features_cross_attention_2], dim=-1))
                 features_extractor_joints = self.features_extractor_joints_container(states['joint'])
-                net = self.net_container(torch.cat([features_extractor_joints, features_extractor_rgb], dim=1))
+                net = self.net_container(torch.cat([features_extractor_joints, features_concat_rgb], dim=1))
+                # features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
+                # net = self.net_container(torch.cat([states['joint'], features_extractor_rgb], dim=1))
                 shared_output = net
             else:
                 shared_output = self._shared_output
@@ -91,7 +165,7 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
             return output, {}
 
 # load and wrap the Isaac Lab environment
-env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Image-Direct-v3")
+env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Image-Direct-v4")
 env = wrap_env(env)
 
 device = env.device
@@ -139,7 +213,7 @@ cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Image-Direct-v0"
 
 cfg["experiment"]["wandb"] = True
 cfg["experiment"]["wandb_kwargs"]["project"] = "cube_grasp_project"
-cfg["experiment"]["wandb_kwargs"]["tags"] = ["512_envs", "image_conv_32732_64321_128321_linear_512", "joint_64", "fusion_256_256", "random_backgrounds_20_hdr", "random_grounds_r0.1to0.2_g0.1to0.2_b0.1to0.2", "random_cubes_r0.1to0.2_g0.1to0.2_b0.1to0.2"]
+cfg["experiment"]["wandb_kwargs"]["tags"] = ["512_envs", "image_conv_32732_64321_128321_linear_512", "joint_64", "fusion_256_256", "random_backgrounds_20_hdr", "random_grounds_r0.1to0.2_g0.1to0.2_b0.1to0.2", "random_cubes_r0.1to0.2_g0.1to0.2_b0.1to0.2", "2_cameras"]
 
 agent = PPO(models=models,
             memory=memory,

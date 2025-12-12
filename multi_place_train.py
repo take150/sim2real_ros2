@@ -3,7 +3,9 @@ import torch.nn as nn
 import torchvision.models as tv_models
 
 # import the skrl components to build the RL system
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from isaaclab.utils.dict import print_dict
+from skrl.multi_agents.torch.mappo import MAPPO, MAPPO_DEFAULT_CONFIG, MAPPO_SHARED
+from skrl.multi_agents.torch.ippo import IPPO, IPPO_DEFAULT_CONFIG
 from skrl.envs.loaders.torch import load_isaaclab_env
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
@@ -13,6 +15,13 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from skrl.utils.spaces.torch import unflatten_tensorized_space
+
+import os
+import numpy as np
+import cv2
+import gymnasium as gym
+from gymnasium.spaces import Box
+from datetime import datetime
 
 import numpy as np
 from functools import partial
@@ -113,13 +122,21 @@ class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
             # nn.SiLU(),
             nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            # nn.SiLU(),
+        )
+
+        self.rnn_other_place = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        self.net_container_other_place = nn.Sequential(
+            nn.Linear(in_features=156, out_features=128),
+            nn.PReLU(),
+        )
+
+        self.net_container_concat_place = nn.Sequential(
+            nn.Linear(in_features=384, out_features=256),
+            nn.PReLU(),
             nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            # nn.SiLU(),
             nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
-            # nn.SiLU(),
         )
 
         self.place_policy_layer = nn.Linear(in_features=64, out_features=self.num_actions)
@@ -129,18 +146,20 @@ class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
             self.net_container: np.sqrt(2),
             self.net_container_move: np.sqrt(2),
             self.net_container_place: np.sqrt(2),
+            self.net_container_other_place: np.sqrt(2),
+            self.net_container_concat_place: np.sqrt(2),
             self.rnn: np.sqrt(2),
             self.rnn_move: np.sqrt(2),
             self.rnn_place: np.sqrt(2),
+            self.rnn_other_place: np.sqrt(2),
             self.policy_layer: 0.01,  # Policy出力は0.01
             self.move_policy_layer: 0.01,
             self.place_policy_layer: 0.01,
         })
-
+        
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        
         task_ids = states['task_id'].squeeze(-1)
         batch_size = task_ids.shape[0]
         is_grasp = (task_ids == 0)
@@ -150,6 +169,7 @@ class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
         log_std_parameter = torch.zeros((batch_size, self.num_actions), device=self.device)
 
         if is_grasp.any():
+            
             rnn_grasp, _ = self.rnn(torch.cat([states['joint'][is_grasp], states['actions'][is_grasp]], dim=-1))
             net_grasp = self.net_container(torch.cat([rnn_grasp[:, -1, :], states['object'][:, -1, :][is_grasp]], dim=-1))
             mu_grasp = self.policy_layer(net_grasp)
@@ -166,14 +186,16 @@ class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
         if is_place.any():
             rnn_place, _ = self.rnn_place(torch.cat([states['joint'][is_place], states['actions'][is_place]], dim=-1))
             net_place = self.net_container_place(torch.cat([rnn_place[:, -1, :], states['object'][:, -1, :][is_place], states['goal'][:, -1, :][is_place]], dim=-1))
-            mu_place = self.place_policy_layer(net_place)
-            output[is_place] = mu_place 
+            rnn_other_place, _ = self.rnn_other_place(torch.cat([states['joint_other'][is_place], states['actions_other'][is_place]], dim=-1))
+            net_other_place = self.net_container_other_place(torch.cat([rnn_other_place[:, -1, :], states['object_other'][:, -1, :][is_place], states['goal_other'][:, -1, :][is_place]], dim=-1))
+            net_concat_place = self.net_container_concat_place(torch.cat([net_place, net_other_place], dim=-1))
+            mu_place = self.place_policy_layer(net_concat_place)
+            output[is_place] = mu_place
             log_std_parameter[is_place] = self.place_log_std_parameter
         
         output = nn.functional.tanh(output)
         
         return output, log_std_parameter, {}
-    
 
 class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
@@ -219,9 +241,9 @@ class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
 
         self.move_value_layer = nn.Linear(in_features=64, out_features=1)
 
-        self.rnn_place = nn.RNN(input_size=41, hidden_size=256, num_layers=2, batch_first=True)
+        self.rnn_place = nn.RNN(input_size=82, hidden_size=512, num_layers=2, batch_first=True)
         self.net_container_place = nn.Sequential(
-            nn.Linear(in_features=256, out_features=256),
+            nn.Linear(in_features=512, out_features=256),
             nn.PReLU(),
             # nn.SiLU(),
             nn.Linear(in_features=256, out_features=256),
@@ -238,17 +260,17 @@ class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
         self.place_value_layer = nn.Linear(in_features=64, out_features=1)
 
         self.apply_orthogonal_init({
-            self.net_container: np.sqrt(2),
-            self.net_container_move: np.sqrt(2),
+            # self.net_container: np.sqrt(2),
+            # self.net_container_move: np.sqrt(2),
             self.net_container_place: np.sqrt(2),
-            self.rnn: np.sqrt(2),
-            self.rnn_move: np.sqrt(2),
+            # self.rnn: np.sqrt(2),
+            # self.rnn_move: np.sqrt(2),
             self.rnn_place: np.sqrt(2),
-            self.value_layer: 1.0,    # Value出力は1.0
-            self.move_value_layer: 1.0,
+            # self.value_layer: 1.0,    # Value出力は1.0
+            # self.move_value_layer: 1.0,
             self.place_value_layer: 1.0,
         })
-
+    
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
@@ -273,7 +295,7 @@ class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
             output[is_move] = move_value
 
         if is_place.any():
-            rnn_place, _ = self.rnn_place(torch.cat([states['joint'][is_place], states['actions'][is_place], states['object'][is_place], states['goal'][is_place]], dim=-1))
+            rnn_place, _ = self.rnn_place(torch.cat([states['joint'][is_place], states['actions'][is_place], states['object'][is_place], states['goal'][is_place], states['joint_other'][is_place], states['actions_other'][is_place], states['object_other'][is_place], states['goal_other'][is_place]], dim=-1))
             net_place = self.net_container_place(rnn_place[:, -1, :])
             place_value = self.place_value_layer(net_place)
             output[is_place] = place_value
@@ -281,34 +303,40 @@ class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
         return output, {}
 
 # load and wrap the Isaac Lab environment
-env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Single-Place-Direct-v0")
+env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Multi-Place-Direct-v0")
 env = wrap_env(env)
 
 device = env.device
 
 # instantiate a memory as rollout buffer (any memory can be used for this)
-memory = RandomMemory(memory_size=24, num_envs=env.num_envs, device=device)
+memories = {}
+memories["robot_1"] = RandomMemory(memory_size=24, num_envs=env.num_envs, device=device)
+memories["robot_2"] = RandomMemory(memory_size=24, num_envs=env.num_envs, device=device)
 
 # instantiate the agent's models (function approximators).
 # PPO requires 2 models, visit its documentation for more details
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#models
+
 models = {}
-# models["policy"] = SharedModel(env.observation_space, env.action_space, device)
-# models["value"] = models["policy"]  # same instance: shared model
-models["policy"] = GaussianModel(env.observation_space, env.action_space, device)
-models["value"] = DeterministicModel(env.observation_space, env.action_space, device)
+models["robot_1"] = {}
+models["robot_1"]["policy"] = GaussianModel(env.observation_spaces["robot_1"], env.action_spaces["robot_1"], device)
+# models["robot_1"]["value"] = DeterministicModel(env.state_space("robot_1"), env.action_spaces["robot_1"], device)
+models["robot_1"]["value"] = DeterministicModel(env.observation_spaces["robot_1"], env.action_spaces["robot_1"], device)
+models["robot_2"] = {}
+models["robot_2"]["policy"] = GaussianModel(env.observation_spaces["robot_2"], env.action_spaces["robot_2"], device)
+# models["robot_2"]["value"] = DeterministicModel(env.state_space("robot_2"), env.action_spaces["robot_2"], device)
+models["robot_2"]["value"] = DeterministicModel(env.observation_spaces["robot_2"], env.action_spaces["robot_2"], device)
 
 # configure and instantiate the agent (visit its documentation to see all the options)
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#configuration-and-hyperparameters
-cfg = PPO_DEFAULT_CONFIG.copy()
+# cfg = MAPPO_DEFAULT_CONFIG.copy()
+cfg = IPPO_DEFAULT_CONFIG.copy()
 cfg["rollouts"] = 24  # memory_size
 cfg["learning_epochs"] = 8
 cfg["mini_batches"] = 6
 cfg["discount_factor"] = 0.97
 cfg["lambda"] = 0.92
 cfg["learning_rate"] = 5.0e-04
-# cfg["learning_rate"] = 0.0000030332
-# cfg["learning_rate"] = 1.0e-06
 cfg["learning_rate_scheduler"] = KLAdaptiveLR
 cfg["learning_rate_scheduler_kwargs"] = {"kl_threshold": 0.01, "kl_factor": 2, "min_lr": 1.0e-06, "max_lr": 5.0e-04, "lr_factor": 1.1}
 cfg["random_timesteps"] = 0
@@ -329,21 +357,31 @@ cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 1
 cfg["experiment"]["checkpoint_interval"] = 100
-cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Image-Place-Direct-v0"
+cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Multi-Image-Place-Direct-v0"
 
-cfg["experiment"]["wandb"] = False
-cfg["experiment"]["wandb_kwargs"]["project"] = "cube_place_project"
+cfg["experiment"]["wandb"] = True
+cfg["experiment"]["wandb_kwargs"]["project"] = "multi_cube_place_project"
 
-agent = PPO(models=models,
-            memory=memory,
+# agent = MAPPO(possible_agents=env.possible_agents,
+#             models=models,
+#             memories=memories,
+#             cfg=cfg,
+#             observation_spaces=env.observation_spaces,
+#             action_spaces=env.action_spaces,
+#             device=device,
+#             shared_observation_spaces=env.state_spaces)
+
+agent = IPPO(possible_agents=env.possible_agents,
+            models=models,
+            memories=memories,
             cfg=cfg,
-            observation_space=env.observation_space,
-            action_space=env.action_space,
+            observation_spaces=env.observation_spaces,
+            action_spaces=env.action_spaces,
             device=device)
 
 
 # configure and instantiate the RL trainer
-cfg_trainer = {"timesteps": 500000, "headless": True}
+cfg_trainer = {"timesteps": 1000000, "headless": True}
 trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 
 # ---------------------------------------------------------
@@ -354,11 +392,14 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 
 # download the trained agent's checkpoint from Hugging Face Hub and load it
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-23_01-30-13-007985_PPO/checkpoints/agent_147000.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-25_11-49-23-003009_PPO/checkpoints/best_agent.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-11-29_12-51-34-735903_PPO/checkpoints/agent_200000.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-06-24_13-50-14-495506_IPPO/checkpoints/best_agent.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-06-24_18-19-07-597924_IPPO/checkpoints/agent_77000.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-23_01-40-05-968627_IPPO/checkpoints/agent_50000.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-11_13-20-43-064217_MAPPO/checkpoints/agent_5000.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-11_00-57-02-969356_MAPPO/checkpoints/agent_140000.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-25_23-05-11-156770_IPPO/checkpoints/agent_311000.pt"
 path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Place-Direct-v0/25-12-08_23-05-26-844061_PPO/checkpoints/best_agent.pt"
-agent.load(path=path)
+agent.load(path)
 
 # start training
 trainer.train()

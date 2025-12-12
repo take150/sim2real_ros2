@@ -32,10 +32,7 @@ class GaussianModel(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
-            nn.PReLU(),
             nn.LazyLinear(out_features=256),
             nn.PReLU(),
             nn.LazyLinear(out_features=128),
@@ -45,28 +42,26 @@ class GaussianModel(GaussianMixin, Model):
         )
 
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
+        self.log_std_parameter = nn.LazyLinear(out_features=self.num_actions)
+        # self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
-        output = self.policy_layer(output)
-        output = nn.functional.tanh(output)
+        output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
+        mu = self.policy_layer(output)
+        mu = nn.functional.tanh(mu)
+        log_std_parameter = self.log_std_parameter(output)
         
-        return output, self.log_std_parameter, {}
+        return mu, log_std_parameter, {}
+        # return output, self.log_std_parameter, {}
 
 class DeterministicModel(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
-
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
-            nn.PReLU(),
             nn.LazyLinear(out_features=256),
             nn.PReLU(),
             nn.LazyLinear(out_features=128),
@@ -80,13 +75,12 @@ class DeterministicModel(DeterministicMixin, Model):
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
-        output = self.net_container(out[:, -1, :])
+        output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
         output = self.value_layer(output)
         return output, {}
 
 # load and wrap the Isaac Lab environment
-env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Single-Direct-v0")
+env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Tuning-Direct-v0")
 env = wrap_env(env)
 
 device = env.device
@@ -134,10 +128,10 @@ cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 1
 cfg["experiment"]["checkpoint_interval"] = 1000
-cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Image-Direct-v0"
+cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Tuning-Direct-v0"
 
-cfg["experiment"]["wandb"] = False
-cfg["experiment"]["wandb_kwargs"]["project"] = "cube_grasp_project"
+cfg["experiment"]["wandb"] = True
+cfg["experiment"]["wandb_kwargs"]["project"] = "tuning_project"
 
 agent = PPO(models=models,
             memory=memory,

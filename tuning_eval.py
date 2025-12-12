@@ -32,10 +32,7 @@ class GaussianModel(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
-            nn.PReLU(),
             nn.LazyLinear(out_features=256),
             nn.PReLU(),
             nn.LazyLinear(out_features=128),
@@ -45,28 +42,25 @@ class GaussianModel(GaussianMixin, Model):
         )
 
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
+        self.log_std_parameter = nn.LazyLinear(out_features=self.num_actions)
+        # self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
-        output = self.policy_layer(output)
-        output = nn.functional.tanh(output)
+        output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
+        mu = self.policy_layer(output)
+        mu = nn.functional.tanh(mu)
+        log_std_parameter = self.log_std_parameter(output)
         
-        return output, self.log_std_parameter, {}
-
+        return mu, log_std_parameter, {}
+        
 class DeterministicModel(DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
-
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
-            nn.PReLU(),
             nn.LazyLinear(out_features=256),
             nn.PReLU(),
             nn.LazyLinear(out_features=128),
@@ -80,13 +74,12 @@ class DeterministicModel(DeterministicMixin, Model):
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
-        output = self.net_container(out[:, -1, :])
+        output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
         output = self.value_layer(output)
         return output, {}
 
 # load and wrap the Isaac Lab environment
-env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Single-Direct-v0")
+env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Tuning-Direct-v0")
 env = wrap_env(env)
 
 device = env.device
@@ -101,43 +94,15 @@ models = {}
 # models["policy"] = SharedModel(env.observation_space, env.action_space, device)
 # models["value"] = models["policy"]  # same instance: shared model
 models["policy"] = GaussianModel(env.observation_space, env.action_space, device)
-models["value"] = DeterministicModel(env.observation_space, env.action_space, device)
+# models["value"] = DeterministicModel(env.observation_space, env.action_space, device)
 
 # configure and instantiate the agent (visit its documentation to see all the options)
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#configuration-and-hyperparameters
 cfg = PPO_DEFAULT_CONFIG.copy()
-cfg["rollouts"] = 24  # memory_size
-cfg["learning_epochs"] = 8
-cfg["mini_batches"] = 6
-cfg["discount_factor"] = 0.97
-cfg["lambda"] = 0.92
-cfg["learning_rate"] = 5.0e-04
-# cfg["learning_rate"] = 0.0000030332
-# cfg["learning_rate"] = 1.0e-06
-cfg["learning_rate_scheduler"] = KLAdaptiveLR
-cfg["learning_rate_scheduler_kwargs"] = {"kl_threshold": 0.01, "kl_factor": 2, "min_lr": 1.0e-06, "max_lr": 5.0e-04, "lr_factor": 1.1}
-cfg["random_timesteps"] = 0
-cfg["learning_starts"] = 0
-cfg["grad_norm_clip"] = 1.0
-cfg["ratio_clip"] = 0.2
-cfg["value_clip"] = 0.2
-cfg["clip_predicted_values"] = True
-cfg["entropy_loss_scale"] = 0.0
-cfg["value_loss_scale"] = 2.0
-cfg["kl_threshold"] = 0.0
-cfg["rewards_shaper_scale"] = 0.01
-cfg["time_limit_bootstrap"] = False
 cfg["state_preprocessor"] = None
 cfg["state_preprocessor_kwargs"] = {}
 cfg["value_preprocessor"] = RunningStandardScaler
 cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
-# logging to TensorBoard and write checkpoints (in timesteps)
-cfg["experiment"]["write_interval"] = 1
-cfg["experiment"]["checkpoint_interval"] = 1000
-cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Image-Direct-v0"
-
-cfg["experiment"]["wandb"] = False
-cfg["experiment"]["wandb_kwargs"]["project"] = "cube_grasp_project"
 
 agent = PPO(models=models,
             memory=memory,
@@ -157,15 +122,15 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 # ---------------------------------------------------------
 # from skrl.utils.huggingface import download_model_from_huggingface
 
+dummy_obs_tensor = {'states': torch.zeros(1, 13, device=device)}
+with torch.no_grad():
+    _ = agent.policy(dummy_obs_tensor)
+
 # download the trained agent's checkpoint from Hugging Face Hub and load it
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-23_01-30-13-007985_PPO/checkpoints/agent_147000.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-25_11-49-23-003009_PPO/checkpoints/best_agent.pt"
-# agent.load(path)
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Tuning-Direct-v0/25-12-12_01-01-53-693514_PPO/checkpoints/best_agent.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Tuning-Direct-v0/25-12-12_00-31-35-444736_PPO/checkpoints/best_agent.pt"
+agent.load(path)
 
-# start training
-trainer.train()
-
-# start evaluation
-# trainer.eval()
+trainer.eval()
 

@@ -212,7 +212,7 @@ student_cfg["experiment"]["write_interval"] = 1
 student_cfg["experiment"]["checkpoint_interval"] = 100
 student_cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0"
 
-student_cfg["experiment"]["wandb"] = True
+student_cfg["experiment"]["wandb"] = False
 student_cfg["experiment"]["wandb_kwargs"]["project"] = "multi_cube_grasp_project"
 
 student_agent = MultiDistillationStudent(possible_agents=env.possible_agents,

@@ -14,12 +14,36 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from skrl.utils.spaces.torch import unflatten_tensorized_space
 
+import numpy as np
+from functools import partial
+
 # seed for reproducibility
 set_seed(42)  # e.g. `set_seed(42)` for fixed seed
 
+class OrthogonalInitMixin:
+    def apply_orthogonal_init(self, module_gains: dict):
+        for module, gain in module_gains.items():
+            # self.init_weights は staticmethod なのでクラスから参照可能
+            module.apply(partial(self._ortho_weights, gain=gain))
+
+    @staticmethod
+    def _ortho_weights(module: nn.Module, gain: float = 1):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=gain)
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+        elif isinstance(module, (nn.RNN, nn.LSTM, nn.GRU)):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'bias' in name:
+                    param.data.fill_(0.0)
+
 
 # define shared model (stochastic and deterministic models) using mixins
-class GaussianModel(GaussianMixin, Model):
+class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         # GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
@@ -33,49 +57,61 @@ class GaussianModel(GaussianMixin, Model):
         )
 
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=13, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.LazyLinear(out_features=self.num_actions)
-        # self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
+        self.policy_layer = nn.Linear(in_features=64, out_features=self.num_actions)
+        # self.log_std_parameter = nn.LazyLinear(out_features=self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
+        self.apply_orthogonal_init({
+            self.net_container: np.sqrt(2),
+            self.policy_layer: 0.01,
+        })
+    
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
         output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(states['joint'])
         mu = self.policy_layer(output)
         mu = nn.functional.tanh(mu)
-        log_std_parameter = self.log_std_parameter(output)
+        # log_std_parameter = self.log_std_parameter(output)
         
-        return mu, log_std_parameter, {}
-        # return output, self.log_std_parameter, {}
+        # return mu, log_std_parameter, {}
+        return mu, self.log_std_parameter, {}
 
-class DeterministicModel(DeterministicMixin, Model):
+class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=13, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.value_layer = nn.LazyLinear(out_features=1)
+        self.value_layer = nn.Linear(in_features=64, out_features=1)
+
+        self.apply_orthogonal_init({
+            self.net_container: np.sqrt(2),
+            self.value_layer: 1.0,
+        })
 
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
         output = self.net_container(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(states['joint'])
         output = self.value_layer(output)
         return output, {}
 
@@ -127,7 +163,7 @@ cfg["value_preprocessor"] = RunningStandardScaler
 cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 1
-cfg["experiment"]["checkpoint_interval"] = 1000
+cfg["experiment"]["checkpoint_interval"] = 100
 cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Tuning-Direct-v0"
 
 cfg["experiment"]["wandb"] = True
@@ -155,6 +191,7 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-23_01-30-13-007985_PPO/checkpoints/agent_147000.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-25_11-49-23-003009_PPO/checkpoints/best_agent.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Tuning-Direct-v0/25-12-17_20-33-27-781869_PPO/checkpoints/best_agent.pt"
 # agent.load(path)
 
 # start training
@@ -162,4 +199,3 @@ trainer.train()
 
 # start evaluation
 # trainer.eval()
-

@@ -14,6 +14,9 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from skrl.utils.spaces.torch import unflatten_tensorized_space
 
+import cv2 
+import numpy as np
+
 # seed for reproducibility
 set_seed(42)  # e.g. `set_seed(42)` for fixed seed
 
@@ -32,26 +35,45 @@ class GaussianModel(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=27, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
+        self.policy_layer = nn.Linear(in_features=64, out_features=self.num_actions)
         self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
+        # image_np = (states["rgb"][0] * 255.0).cpu().numpy().astype(np.uint8)  # RGB形式
+        # # RGBからBGRに変換（OpenCVの表示用）
+        # image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+        # # 画像を拡大。ここでは2倍に拡大する例。
+        # scale_factor = 10.0
+        # image_np = cv2.resize(image_np, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
+
+        # # ウィンドウを表示（WINDOW_NORMALでウィンドウサイズの変更を可能に）
+        # cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
+
+        # # 画像をリアルタイムで表示
+        # cv2.imshow('Camera Feed', image_np)
+
+        # # 'q'キーが押されたらウィンドウを閉じる処理
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     cv2.destroyAllWindows()
+        #     exit()
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
+        output = self.net_container(torch.cat([states['joint'][:, -1, :], states['actions'][:, -1, :], states['object'][:, -1, :]], dim=-1))
         output = self.policy_layer(output)
         output = nn.functional.tanh(output)
         
@@ -62,31 +84,33 @@ class DeterministicModel(DeterministicMixin, Model):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
+        # self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
 
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=27, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.value_layer = nn.LazyLinear(out_features=1)
+        self.value_layer = nn.Linear(in_features=64, out_features=1)
 
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
-        output = self.net_container(out[:, -1, :])
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
+        # output = self.net_container(out[:, -1, :])
+        output = self.net_container(torch.cat([states['joint'][:, -1, :], states['actions'][:, -1, :], states['object'][:, -1, :]], dim=-1))
         output = self.value_layer(output)
         return output, {}
 
 # load and wrap the Isaac Lab environment
 env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Single-Direct-v0")
+# env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Single-Distillation-Direct-v0")
 env = wrap_env(env)
 
 device = env.device
@@ -125,7 +149,8 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 # download the trained agent's checkpoint from Hugging Face Hub and load it
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-23_01-30-13-007985_PPO/checkpoints/agent_147000.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-11-29_12-51-34-735903_PPO/checkpoints/agent_200000.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/26-01-22_01-11-30-948756_PPO/checkpoints/agent_36200.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/26-01-17_23-58-23-184865_PPO/checkpoints/agent_13400.pt"
 agent.load(path)
 
 # start training

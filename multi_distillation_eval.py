@@ -48,53 +48,163 @@ class DeterministicStudentModel(DeterministicMixin, Model):
             nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
             nn.PReLU(),
             nn.Flatten(),
-            nn.LazyLinear(out_features=512),
+            nn.Linear(in_features=8192,out_features=512),
             nn.PReLU(),
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=525, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
 
-        self.rnn_other = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container_other = nn.Sequential(
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=13, out_features=256),
+            nn.PReLU(),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
 
         self.net_container_concat = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
-            nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
 
-        self.policy_action_layer = nn.LazyLinear(out_features=self.num_actions)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
+        self.policy_action_layer = nn.Linear(in_features=128, out_features=self.num_actions)
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
-        taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
+        image_np = (states["rgb"][0] * 255.0).cpu().numpy().astype(np.uint8)  # RGB形式
+        # RGBからBGRに変換（OpenCVの表示用）
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+        # 画像を拡大。ここでは2倍に拡大する例。
+        scale_factor = 10.0
+        image_np = cv2.resize(image_np, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
+
+        # ウィンドウを表示（WINDOW_NORMALでウィンドウサイズの変更を可能に）
+        cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
+
+        # 画像をリアルタイムで表示
+        cv2.imshow('Camera Feed', image_np)
+
+        # 'q'キーが押されたらウィンドウを閉じる処理
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.destroyAllWindows()
+            exit()
         features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([features_extractor_rgb, out[:, -1, :]], dim=-1))
-        out_other, _ = self.rnn_other(torch.cat([states['joint_other'], states['actions_other']], dim=-1))
-        output_other = self.net_container_other(out_other[:, -1, :])
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([features_extractor_rgb, out[:, -1, :]], dim=-1))
+        # flat_joints = states['joint'].view(states['joint'].size(0), -1)
+        # flat_actions = states['actions'].view(states['actions'].size(0), -1)
+        # output = self.net_container(torch.cat([features_extractor_rgb, flat_joints, flat_actions], dim=-1))
+        output = self.net_container(torch.cat([features_extractor_rgb, states['joint'][:, -1, :], states['actions'][:, -1, :]], dim=-1))
+        # out_other, _ = self.rnn_other(torch.cat([states['joint_other'], states['actions_other']], dim=-1))
+        # output_other = self.net_container_other(out_other[:, -1, :])
+        # flat_joints_other = states['joint_other'].view(states['joint_other'].size(0), -1)
+        # flat_actions_other = states['actions_other'].view(states['actions_other'].size(0), -1)
+        # output_other = self.net_container_other(torch.cat([flat_joints_other, flat_actions_other], dim=-1))
+        output_other = self.net_container_other(torch.cat([states['joint_other'][:, -1, :], states['actions_other'][:, -1, :]], dim=-1))
         output = self.net_container_concat(torch.cat([output, output_other], dim=-1))
+        
+        output = self.policy_action_layer(output)
+        output = nn.functional.tanh(output)
+        
+        return output, {}
+
+class DeterministicStudentModel_(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device):
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(
+            self,
+            clip_actions=False,
+        )
+
+        self.features_extractor_rgb_container = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=7, stride=4, padding=2),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
+            nn.PReLU(),
+            nn.Flatten(),
+            nn.Linear(in_features=8192,out_features=512),
+            nn.PReLU(),
+        )
+
+        self.net_container = nn.Sequential(
+            nn.Linear(in_features=525, out_features=256),
+            nn.PReLU(),
+            nn.Linear(in_features=256, out_features=128),
+            nn.PReLU(),
+        )
+
+        self.net_container_other = nn.Sequential(
+            nn.Linear(in_features=13, out_features=256),
+            nn.PReLU(),
+            nn.Linear(in_features=256, out_features=128),
+            nn.PReLU(),
+        )
+
+        self.net_container_concat = nn.Sequential(
+            nn.Linear(in_features=256, out_features=256),
+            nn.PReLU(),
+            nn.Linear(in_features=256, out_features=128),
+            nn.PReLU(),
+        )
+
+        self.policy_action_layer = nn.Linear(in_features=128, out_features=self.num_actions)
+        
+    def compute(self, inputs, role=""):
+        states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
+        image_np = (states["rgb"][0] * 255.0).cpu().numpy().astype(np.uint8)  # RGB形式
+        # RGBからBGRに変換（OpenCVの表示用）
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+        # 画像を拡大。ここでは2倍に拡大する例。
+        scale_factor = 10.0
+        image_np = cv2.resize(image_np, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
+
+        # ウィンドウを表示（WINDOW_NORMALでウィンドウサイズの変更を可能に）
+        cv2.namedWindow('Camera Feed_', cv2.WINDOW_NORMAL)
+
+        # 画像をリアルタイムで表示
+        cv2.imshow('Camera Feed_', image_np)
+
+        # 'q'キーが押されたらウィンドウを閉じる処理
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.destroyAllWindows()
+            exit()
+        features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([features_extractor_rgb, out[:, -1, :]], dim=-1))
+        # flat_joints = states['joint'].view(states['joint'].size(0), -1)
+        # flat_actions = states['actions'].view(states['actions'].size(0), -1)
+        # output = self.net_container(torch.cat([features_extractor_rgb, flat_joints, flat_actions], dim=-1))
+        output = self.net_container(torch.cat([features_extractor_rgb, states['joint'][:, -1, :], states['actions'][:, -1, :]], dim=-1))
+        # out_other, _ = self.rnn_other(torch.cat([states['joint_other'], states['actions_other']], dim=-1))
+        # output_other = self.net_container_other(out_other[:, -1, :])
+        # flat_joints_other = states['joint_other'].view(states['joint_other'].size(0), -1)
+        # flat_actions_other = states['actions_other'].view(states['actions_other'].size(0), -1)
+        # output_other = self.net_container_other(torch.cat([flat_joints_other, flat_actions_other], dim=-1))
+        output_other = self.net_container_other(torch.cat([states['joint_other'][:, -1, :], states['actions_other'][:, -1, :]], dim=-1))
+        output = self.net_container_concat(torch.cat([output, output_other], dim=-1))
+        
         output = self.policy_action_layer(output)
         output = nn.functional.tanh(output)
         
         return output, {}
 
 # load and wrap the Isaac Lab environment
-env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Multi-Distillation-Direct-v0")
+# from multi_env import Turtlebot3Image
+# from image_log_env import Turtlebot3Image
+# env = Turtlebot3Image()
+env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Multi-Place-Distillation-Direct-v0")
 env = wrap_env(env)
+# env = wrap_env(env=env, wrapper="isaaclab-multi-agent")
 
 device = env.device
 
@@ -111,7 +221,7 @@ student_models = {}
 student_models["robot_1"] = {}
 student_models["robot_1"]["policy"] = DeterministicStudentModel(env.observation_spaces["robot_1"], env.action_spaces["robot_1"], device)
 student_models["robot_2"] = {}
-student_models["robot_2"]["policy"] = DeterministicStudentModel(env.observation_spaces["robot_2"], env.action_spaces["robot_2"], device)
+student_models["robot_2"]["policy"] = DeterministicStudentModel_(env.observation_spaces["robot_2"], env.action_spaces["robot_2"], device)
 
 # configure and instantiate the agent (visit its documentation to see all the options)
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html#configuration-and-hyperparameters
@@ -140,9 +250,10 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=student_agent)
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-06-24_13-50-14-495506_IPPO/checkpoints/best_agent.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-06-24_18-19-07-597924_IPPO/checkpoints/agent_77000.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-06-26_13-55-07-436154_IPPO/checkpoints/agent_411000.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-30_12-32-53-762463_MultiDistillationStudent/checkpoints/agent_29300.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-30_07-41-17-098814_MultiDistillationStudent/checkpoints/agent_56000.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-16_12-41-42-178899_MultiDistillationStudent/checkpoints/agent_14000.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-19_21-54-33-360376_MultiDistillationStudent/checkpoints/agent_24960.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-21_13-12-06-858108_MultiDistillationStudent/checkpoints/agent_14400.pt"
+# path = "/home/takenami/Desktop/agent_49800.pt"
 student_agent.load(path)
 
 # start training

@@ -14,12 +14,35 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from skrl.utils.spaces.torch import unflatten_tensorized_space
 
+import numpy as np
+from functools import partial
+
 # seed for reproducibility
 set_seed(42)  # e.g. `set_seed(42)` for fixed seed
 
+class OrthogonalInitMixin:
+    def apply_orthogonal_init(self, module_gains: dict):
+        for module, gain in module_gains.items():
+            # self.init_weights は staticmethod なのでクラスから参照可能
+            module.apply(partial(self._ortho_weights, gain=gain))
+
+    @staticmethod
+    def _ortho_weights(module: nn.Module, gain: float = 1):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=gain)
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+        elif isinstance(module, (nn.RNN, nn.LSTM, nn.GRU)):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'bias' in name:
+                    param.data.fill_(0.0)
 
 # define shared model (stochastic and deterministic models) using mixins
-class GaussianModel(GaussianMixin, Model):
+class GaussianModel(GaussianMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         # GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, reduction)
@@ -32,56 +55,70 @@ class GaussianModel(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=27, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
+        self.policy_layer = nn.Linear(in_features=64, out_features=self.num_actions)
         self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
+        self.apply_orthogonal_init({
+            self.net_container: np.sqrt(2),
+            # self.rnn: np.sqrt(2),
+            self.policy_layer: 0.01,  # Policy出力は0.01
+        })
+
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :]], dim=-1))
+        output = self.net_container(torch.cat([states['joint'][:, -1, :], states['actions'][:, -1, :], states['object'][:, -1, :]], dim=-1))
         output = self.policy_layer(output)
         output = nn.functional.tanh(output)
         
         return output, self.log_std_parameter, {}
 
-class DeterministicModel(DeterministicMixin, Model):
+class DeterministicModel(DeterministicMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
+        # self.rnn = nn.RNN(input_size=27, hidden_size=256, num_layers=2, batch_first=True)
 
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=27, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.value_layer = nn.LazyLinear(out_features=1)
+        self.value_layer = nn.Linear(in_features=64, out_features=1)
+
+        self.apply_orthogonal_init({
+            self.net_container: np.sqrt(2),
+            # self.rnn: np.sqrt(2),
+            self.value_layer: 1.0
+        })
 
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
-        output = self.net_container(out[:, -1, :])
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object']], dim=-1))
+        # output = self.net_container(out[:, -1, :])
+        output = self.net_container(torch.cat([states['joint'][:, -1, :], states['actions'][:, -1, :], states['object'][:, -1, :]], dim=-1))
         output = self.value_layer(output)
         return output, {}
 
@@ -108,7 +145,8 @@ models["value"] = DeterministicModel(env.observation_space, env.action_space, de
 cfg = PPO_DEFAULT_CONFIG.copy()
 cfg["rollouts"] = 24  # memory_size
 cfg["learning_epochs"] = 8
-cfg["mini_batches"] = 6
+cfg["mini_batches"] = 48
+# cfg["mini_batches"] = 8
 cfg["discount_factor"] = 0.97
 cfg["lambda"] = 0.92
 cfg["learning_rate"] = 5.0e-04
@@ -133,10 +171,10 @@ cfg["value_preprocessor"] = RunningStandardScaler
 cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg["experiment"]["write_interval"] = 1
-cfg["experiment"]["checkpoint_interval"] = 1000
+cfg["experiment"]["checkpoint_interval"] = 100
 cfg["experiment"]["directory"] = "runs/torch/Isaac-Turtlebot3-Image-Direct-v0"
 
-cfg["experiment"]["wandb"] = False
+cfg["experiment"]["wandb"] = True
 cfg["experiment"]["wandb_kwargs"]["project"] = "cube_grasp_project"
 
 agent = PPO(models=models,

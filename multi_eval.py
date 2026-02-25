@@ -42,39 +42,67 @@ class GaussianModel(GaussianMixin, Model):
             reduction="sum",
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.net_container = nn.Sequential(
+        #     nn.Linear(in_features=149, out_features=256),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=256, out_features=256),
+        #     nn.PReLU(),
+        # )
+
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=86, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
 
-        self.rnn_other = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+
+        # self.rnn_other = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.net_container_other = nn.Sequential(
+        #     nn.Linear(in_features=142, out_features=128),
+        #     nn.PReLU(),
+        # )
+
         self.net_container_other = nn.Sequential(
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=79, out_features=256),
+            nn.PReLU(),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
+
+        # self.net_container_concat = nn.Sequential(
+        #     nn.Linear(in_features=384, out_features=256),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=256, out_features=128),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=128, out_features=64),
+        #     nn.PReLU(),
+        # )
 
         self.net_container_concat = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
-            nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
 
-        self.policy_action_layer = nn.LazyLinear(out_features=self.num_actions)
+        self.policy_action_layer = nn.Linear(in_features=128, out_features=self.num_actions)
         self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :], states['goal'][:, -1, :]], dim=-1))
-        out_other, _ = self.rnn_other(torch.cat([states['joint_other'], states['actions_other']], dim=-1))
-        output_other = self.net_container_other(torch.cat([out_other[:, -1, :], states['object_other'][:, -1, :]], dim=-1))
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([out[:, -1, :], states['object'][:, -1, :], states['goal'][:, -1, :]], dim=-1))
+        flat_joints = states['joint'].view(states['joint'].size(0), -1)
+        flat_actions = states['actions'].view(states['actions'].size(0), -1)
+        output = self.net_container(torch.cat([flat_joints, flat_actions, states['object'][:, -1, :], states['goal'][:, -1, :]], dim=-1))
+        # out_other, _ = self.rnn_other(torch.cat([states['joint_other'], states['actions_other']], dim=-1))
+        # output_other = self.net_container_other(torch.cat([out_other[:, -1, :], states['object_other'][:, -1, :]], dim=-1))
+        flat_joints_other = states['joint_other'].view(states['joint_other'].size(0), -1)
+        flat_actions_other = states['actions_other'].view(states['actions_other'].size(0), -1)
+        output_other = self.net_container_other(torch.cat([flat_joints_other, flat_actions_other, states['object_other'][:, -1, :]], dim=-1))
         output = self.net_container_concat(torch.cat([output, output_other], dim=-1))
         mu = self.policy_action_layer(output)
         mu = nn.functional.tanh(mu)
@@ -86,30 +114,52 @@ class DeterministicModel(DeterministicMixin, Model):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
 
-        self.rnn = nn.RNN(input_size=61, hidden_size=512, num_layers=2, batch_first=True)
+        # self.rnn = nn.RNN(input_size=61, hidden_size=512, num_layers=2, batch_first=True)
         
+        # self.net_container = nn.Sequential(
+        #     nn.Linear(in_features=512, out_features=256),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=256, out_features=256),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=256, out_features=128),
+        #     nn.PReLU(),
+        #     nn.Linear(in_features=128, out_features=64),
+        #     nn.PReLU(),
+        # )
+
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=305, out_features=512),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=512, out_features=512),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=512, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
         )
+        
 
-        self.value_layer = nn.LazyLinear(out_features=1)
+        self.value_layer = nn.Linear(in_features=128, out_features=1)
 
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object'], states['goal'], states['joint_other'], states['actions_other'], states['object_other']], dim=-1))
-        output = self.net_container(out[:, -1, :])
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions'], states['object'], states['goal'], states['joint_other'], states['actions_other'], states['object_other']], dim=-1))
+        # output = self.net_container(out[:, -1, :])
+        combined_seq = torch.cat([
+            states['joint'], 
+            states['actions'], 
+            states['object'], 
+            states['goal'], 
+            states['joint_other'], 
+            states['actions_other'], 
+            states['object_other']
+        ], dim=-1)
+        flattened_input = combined_seq.view(combined_seq.size(0), -1)
+        output = self.net_container(flattened_input)
         output = self.value_layer(output)
         
         return output, {}
-
 
 # load and wrap the Isaac Lab environment
 env = load_isaaclab_env(task_name="Isaac-Turtlebot3-Multi-Direct-v0")
@@ -167,10 +217,11 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 
 # download the trained agent's checkpoint from Hugging Face Hub and load it
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-23_12-26-06-973047_IPPO/checkpoints/agent_288000.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-18_01-38-50-897039_IPPO/checkpoints/agent_409000.pt"
-# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-18_01-38-50-897039_IPPO/checkpoints/agent_716000.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-25_23-05-11-156770_IPPO/checkpoints/agent_311000.pt"
-path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/25-11-27_13-34-48-552097_IPPO/checkpoints/agent_898800.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-10_00-39-48-025307_IPPO/checkpoints/agent_294800.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-12_13-52-49-095216_IPPO/checkpoints/agent_205100.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-16_15-58-56-043259_IPPO/checkpoints/agent_53900.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-16_21-22-17-325664_IPPO/checkpoints/agent_164000.pt"
+# path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Multi-Image-Direct-v0/26-01-16_10-55-52-743738_IPPO/checkpoints/agent_11300.pt"
 agent.load(path)
 
 # start evaluation

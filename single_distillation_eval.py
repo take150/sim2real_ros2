@@ -16,12 +16,39 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 from skrl.utils.spaces.torch import unflatten_tensorized_space
 
+import cv2
+import numpy as np
+from functools import partial
+
+
 # seed for reproducibility
 set_seed(42)  # e.g. `set_seed(42)` for fixed seed
 
 
+class OrthogonalInitMixin:
+    def apply_orthogonal_init(self, module_gains: dict):
+        for module, gain in module_gains.items():
+            # self.init_weights は staticmethod なのでクラスから参照可能
+            module.apply(partial(self._ortho_weights, gain=gain))
+
+    @staticmethod
+    def _ortho_weights(module: nn.Module, gain: float = 1):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=gain)
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+        elif isinstance(module, (nn.RNN, nn.LSTM, nn.GRU)):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data, gain=gain)
+                elif 'bias' in name:
+                    param.data.fill_(0.0)
+
+
 # define shared model (stochastic and deterministic models) using mixins
-class DeterministicStudentModel(DeterministicMixin, Model):
+class DeterministicStudentModel(DeterministicMixin, Model, OrthogonalInitMixin):
     def __init__(self, observation_space, action_space, device):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(
@@ -37,30 +64,44 @@ class DeterministicStudentModel(DeterministicMixin, Model):
             nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1),
             nn.PReLU(),
             nn.Flatten(),
-            nn.LazyLinear(out_features=512),
+            nn.Linear(in_features=8192, out_features=512),
             nn.PReLU(),
         )
 
-        self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        # self.rnn = nn.RNN(input_size=13, hidden_size=128, num_layers=1, batch_first=True)
+        self.features_extractor_joints_container = nn.Sequential(
+            nn.Linear(in_features=13, out_features=64),
+            nn.PReLU(),
+        )
         
         self.net_container = nn.Sequential(
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=576, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=256),
+            nn.Linear(in_features=256, out_features=256),
             nn.PReLU(),
-            nn.LazyLinear(out_features=128),
+            nn.Linear(in_features=256, out_features=128),
             nn.PReLU(),
-            nn.LazyLinear(out_features=64),
+            nn.Linear(in_features=128, out_features=64),
             nn.PReLU(),
         )
 
-        self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
+        self.policy_layer = nn.Linear(in_features=64, out_features=self.num_actions)
+
+        self.apply_orthogonal_init({
+            self.features_extractor_rgb_container: np.sqrt(2),
+            self.features_extractor_joints_container: np.sqrt(2),
+            self.net_container: np.sqrt(2),
+            # self.rnn: np.sqrt(2),
+            self.policy_layer: 0.01,  # Policy出力は0.01
+        })
         
     def compute(self, inputs, role=""):
         states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
         features_extractor_rgb = self.features_extractor_rgb_container(torch.permute(states['rgb'], (0, 3, 1, 2)))        
-        out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
-        output = self.net_container(torch.cat([features_extractor_rgb, out[:, -1, :]], dim=-1))
+        # out, _ = self.rnn(torch.cat([states['joint'], states['actions']], dim=-1))
+        # output = self.net_container(torch.cat([features_extractor_rgb, out[:, -1, :]], dim=-1))
+        features_extractor_joints = self.features_extractor_joints_container(torch.cat([states['joint'][:, -1, :], states['actions'][:, -1, :]], dim=-1))
+        output = self.net_container(torch.cat([features_extractor_rgb, features_extractor_joints], dim=-1))
         output = self.policy_layer(output)
         output = nn.functional.tanh(output)
         
@@ -109,6 +150,7 @@ trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=student_agent)
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-05-08_13-47-18-171591_PPO/checkpoints/best_agent.pt"
 # path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-06-23_01-30-13-007985_PPO/checkpoints/agent_147000.pt"
 path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/25-11-29_22-49-01-159419_DistillationStudent/checkpoints/agent_154700.pt"
+path = "/home/takenami/sim2real_ros2/runs/torch/Isaac-Turtlebot3-Image-Direct-v0/26-01-15_17-30-41-163713_DistillationStudent/checkpoints/agent_4300.pt"
 student_agent.load(path)
 
 # start training
